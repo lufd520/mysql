@@ -1,0 +1,104 @@
+import pymysql
+import argparse
+import subprocess
+import sys
+
+#磁盘文件与统计信息的差值大小
+DIFF_THRESHOLD = 20  # GB
+#mysql data目录
+Data_Dir = '/var/lib/mysql/'
+#存放data、binlog的根目录，默认是/data
+Root_Dir = '/data'
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Database table size checker")
+    parser.add_argument('-host', type=str, help='MySQL host address', required=True)
+    return parser.parse_args()
+def connect_to_database(config):
+    try:
+        conn = pymysql.connect(**config)
+        return conn
+    except pymysql.MySQLError as err:
+        print(f"Error connecting to database: {err}")
+        sys.exit(1)
+def run_shell_command(command):
+    """执行Shell命令并返回输出"""
+    try:
+        result = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True)
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Command execution failed: {e}")
+        sys.exit(1)
+def get_table_size(host):
+    """获取数据库中前10个最大的表及其大小"""
+    conn_config = {'host': host, 'user': 'root', 'password': 'Oracle123', 'db': 'information_schema'}
+    conn = connect_to_database(conn_config)
+    try:
+        cursor = conn.cursor()
+        query = """
+            SELECT TABLE_SCHEMA, TABLE_NAME, ROUND(((data_length + index_length) / 1024 / 1024 / 1024), 6) AS Total_GB
+            FROM information_schema.TABLES 
+            ORDER BY Total_GB DESC 
+            LIMIT 10;
+        """
+        cursor.execute(query)
+        schema_list, table_list, size_list = [], [], []
+        for row in cursor.fetchall():
+            schema_list.append(row[0])
+            table_list.append(row[1])
+            size_list.append(float(row[2]))
+        return schema_list, table_list, size_list
+    except Exception as err:
+        print("Error in print_table_size:", err)
+        sys.exit(1)
+    finally:
+        cursor.close()
+        conn.close()
+
+def get_file_size(schema_list, table_list,size_list,host):
+    file_size_list, diff_list = [], []
+    try:
+        for schema, table,size in zip(schema_list, table_list,size_list):
+            file_size = run_shell_command(f"ssh {host} \"du -s {Data_Dir}{schema}/{table}*.ibd | awk '{{sum += \\$1}} END {{print sum / 1024 / 1024}}'\"")
+            file_size_list.append(f" {file_size} GB")
+            file_size = float(file_size)
+            diff = file_size - size
+            if diff > DIFF_THRESHOLD:
+                diff_list.append(f"{schema}.{table} diff:{diff} GB")
+        return file_size_list,diff_list
+    except Exception as err:
+        print("Error in get_file_size:", err)
+
+def write_output(disk_usage, dirsize, schema_list, table_list, size_list, file_size_list, diff_list):
+    """将结果写入输出文件"""
+    with open('output.txt', "w") as file:
+        file.write('')
+        file.write("#### Need_usage_disk ####:\n")
+        file.write(f"Need_usage_disk:{disk_usage}\n")
+        file.write("#### Directory size ####:\n")
+        file.write(dirsize + '\n')
+        file.write("\n#### Top 10 tables by size ####:\n")
+        for schema, table, size, file_size in zip(schema_list, table_list, size_list, file_size_list):
+            file.write(f"{schema}.{table} : {size} GB  file_size :{file_size}\n")
+        file.write(f"\n#### File Diff sizes(file_size - table_size =={DIFF_THRESHOLD} ####):\n")
+        for diff in diff_list:
+            file.write(diff + '\n')
+def main():
+    args = parse_arguments()
+
+    disk_usage = run_shell_command(f"ssh {args.host} \"df -T | grep {Root_Dir} | awk '{{total = \\$3; used = \\$4; result = used - (total * 0.6); print result / 1024 / 1024}}'\" ")
+
+    dirsize = run_shell_command(f"ssh {args.host} \"du -sh {Data_Dir}*\"")
+
+    #通过SQL得到表的大小
+    schema_list, table_list, size_list = get_table_size(args.host)
+
+    #得到文件大小以及对应的差值
+    file_size_list,diff_list = get_file_size(schema_list, table_list,size_list,args.host)
+
+    #将结果输出到文件中
+    write_output(disk_usage, dirsize, schema_list, table_list, size_list, file_size_list, diff_list)
+
+
+if __name__ == "__main__":
+    main()
