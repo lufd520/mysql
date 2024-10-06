@@ -1,0 +1,172 @@
+import sys
+import pymysql
+import argparse
+
+
+# 解析命令行参数
+def parser():
+    parser = argparse.ArgumentParser(description="lufd_check_user")
+    parser.add_argument('-host', nargs='+', help='IP address list', required=True)
+    parser.add_argument('-check', action='store_true', help='Only check user privileges without exec')
+    parser.add_argument('-run', action='store_true', help='Exec user privileges')
+    return parser.parse_args()
+
+# 连接数据库
+def connect_to_database(config):
+    try:
+        return pymysql.connect(**config)
+    except pymysql.MySQLError as e:
+        print("Database connection failed: {}".format(e))
+        sys.exit(1)
+
+
+# 生成主从库配置
+def str_master_slave_config(host):
+    #cloud45dbm.db.mysql
+    slave_host = host.replace('dbm','dbs')
+    master_config = {
+        'host': host,
+        'port': 3306,
+        'user': 'xxxx',
+        'password': 'xxx',
+        'database': 'mysql'
+    }
+    slave_config = {
+        'host': slave_host,
+        'port': 3306,
+        'user': 'xxxx',
+        'password': 'xxxx',
+        'database': 'mysql'
+    }
+    return master_config, slave_config
+
+
+# 获取用户及权限信息
+def fetch_user_and_privileges(config):
+    user_list, privi_list = [], []
+    try:
+        conn = connect_to_database(config)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT CONCAT(user,'@\\'',host,'\\'') FROM mysql.user WHERE user NOT LIKE 'mysql%' ORDER BY user,host;")
+        users = cursor.fetchall()
+        user_list = [row[0] for row in users]  # 提取用户列表，eg:user@'10.%'
+        for user_host in user_list:     #通过用户名字，获取对应的权限，后面也要进行对比
+            cursor.execute("SHOW GRANTS FOR {}".format(user_host))
+            grants = cursor.fetchall()
+            privi_list.extend(grant[0] for grant in grants)  # 收集权限
+    except pymysql.MySQLError as e:
+        print("Failed to fetch user or privileges: {}".format(e))
+    finally:
+        cursor.close()
+        conn.close()
+    return user_list, privi_list
+
+
+# 创建账户字典
+def create_account_dict(account_list):
+    account_dict = {}
+    for item in account_list:
+        username, ip = item.split('@')
+        account_dict.setdefault(username, set()).add(ip)  # 将IP存为集合
+    return account_dict
+
+
+# 比较账户字典
+def compare_account_dicts(dict1, dict2):
+    only_in_dict1 = {}
+    only_in_dict2 = {}
+    different_ips = {}
+    print('*******对比权限')
+    # 遍历第一个字典，查找第二个字典中没有的用户名或不同的IP
+    for username, ips1 in dict1.items():
+        if username not in dict2:
+            only_in_dict1[username] = ips1
+        else:
+            ips2 = dict2[username]
+            if ips1 != ips2:  # 如果两个列表中的IP不同
+                different_ips[username] = (ips1, ips2)
+    # 遍历第二个字典，查找第一个字典中没有的用户名
+    for username, ips2 in dict2.items():
+        if username not in dict1:
+            only_in_dict2[username] = ips2
+
+    return only_in_dict1, only_in_dict2, different_ips
+
+# 创建或同步用户及权限
+def create_user_privi(src_config, dest_config, diff_list):
+    try:
+        print('*****开始拉取远端数据')
+        creuser_list, privi_list = [], []
+        src_conn = connect_to_database(src_config)
+        cursor = src_conn.cursor()
+        for user_host in diff_list:
+            cursor.execute("SHOW CREATE USER {}".format(user_host))
+            creuser_list.append(cursor.fetchone()[0])
+            cursor.execute("SHOW GRANTS FOR {}".format(user_host))
+
+            privi_list.extend(grant[0] for grant in cursor.fetchall())
+        # 执行创建用户和权限同步
+        print('*****执行创建用户和权限同步')
+        dest_conn = connect_to_database(dest_config)
+        des_cursor = dest_conn.cursor()
+        des_cursor.execute("set sql_log_bin=0;")
+        for user_stmt in creuser_list:
+            des_cursor.execute(user_stmt)  # 执行用户创建语句
+        for privi_stmt in privi_list:
+            des_cursor.execute(privi_stmt)  # 执行权限语句
+        des_cursor.execute("set sql_log_bin=1;")
+        print('*****执行完成')
+    except pymysql.MySQLError as e:
+        print("Error syncing users or privileges: {}".format(e))
+    finally:
+        cursor.close()
+        des_cursor.close()
+        dest_conn.close()
+        src_conn.close()
+
+
+# 主函数
+def main():
+    args = parser()
+    for host in args.host:
+        master_config, slave_config = str_master_slave_config(host)
+
+        print('*****获取主库和从库的用户和权限信息')
+        master_user_list, master_privi_list = fetch_user_and_privileges(master_config)
+        slave_user_list, slave_privi_list = fetch_user_and_privileges(slave_config)
+        print('*****获取主库和从库的用户和权限信息完成')
+        diff_m = set(master_user_list) - set(slave_user_list)        # 主库多的用户：diff_m
+        diff_s = set(slave_user_list) - set(master_user_list)        # 从库多的用户：diff_s
+        #如果传入了check参数，则不执行，只检查：
+        if args.check:
+            if not diff_m and not diff_s and master_privi_list == slave_privi_list:
+                print("{}: 用户和权限相等".format(host))
+            else:
+                dict1 = create_account_dict(master_user_list)
+                dict2 = create_account_dict(slave_user_list)
+                only_in_dict1, only_in_dict2, different_ips = compare_account_dicts(dict1, dict2)#比较用户和主机ip
+
+                if only_in_dict1:
+                    print("{}: 只在主库中的用户和IP: {}".format(host, ', '.join(
+                    "{}@{}".format(username, list(ips)[0]) for username, ips in only_in_dict1.items())))
+                if only_in_dict2:
+                    print("{}: 只在从库中的用户和IP: {}".format(host, ', '.join(
+                    "{}@{}".format(username, list(ips)[0]) for username, ips in only_in_dict2.items())))
+                #主要是防止如果用户相同，ip不同的情况下，可能对生产环境会有危害，所以单独打印出来
+                if different_ips:
+                    print("{}: 用户名相同但IP不同:".format(host))
+                    for user, (ips1, ips2) in different_ips.items():
+                        print("  用户名: {}, 主库IP: {}, 从库IP: {}".format(user, ips1, ips2))
+        #如果传入run，则修改用户及权限
+        elif args.run:
+            if diff_s:
+                create_user_privi(slave_config, master_config, diff_s)
+            if diff_m:
+                create_user_privi(master_config, slave_config, diff_m)
+        else:
+            print("no args")
+
+
+if __name__ == "__main__":
+    main()
