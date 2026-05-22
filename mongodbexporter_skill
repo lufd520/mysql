@@ -1,0 +1,213 @@
+---
+inclusion: manual
+---
+
+# MongoDB 分片集群监控报警方案
+
+## 集群概况
+
+- MongoDB 版本：3.4
+- 架构：分片集群（Sharded Cluster）
+- 集群数量：多套（具体数量待补充）
+- 总节点数：约 30 台 MongoDB 机器
+- 每套集群包含：mongos、shard（副本集）、config server（副本集）
+
+## 监控架构
+
+```
+MongoDB 实例 → mongodb_exporter (每实例一个) → Prometheus → Alertmanager → webhook-bridge → 公司报警接口
+```
+
+## 组件版本与选型
+
+| 组件 | 版本 | 说明 |
+|------|------|------|
+| mongodb_exporter | v0.20.9 | 必须用 0.20.x，新版不兼容 3.4 |
+| Prometheus | v2.45.6 | LTS 版本 |
+| Alertmanager | v0.27.0 | 标准版 |
+| webhook-bridge | 自研 Go 服务 | 对接公司报警接口 |
+| Grafana Dashboard | ID 2583 / 14997 | Percona 官方 MongoDB 面板 |
+
+## 部署规范
+
+### 目录结构
+
+所有组件部署在 `/data/` 目录下（不是 /opt）：
+
+```
+/data/prometheus/           # Prometheus
+/data/prometheus/rules/     # 报警规则
+/data/prometheus/data/      # 时序数据存储
+/data/alertmanager/         # Alertmanager
+/data/webhook-bridge/       # webhook 桥接服务
+```
+
+mongodb_exporter 部署在各 MongoDB 节点上。
+
+### 监控服务器
+
+- IP：10.201.1.126
+- 配置：2C 4G 50G SSD 足够（30 台节点场景）
+- 运行服务：Prometheus(:9090)、Alertmanager(:9093)、webhook-bridge(:8090)
+
+### 端口分配
+
+| 服务 | 端口 | 部署位置 |
+|------|------|---------|
+| mongodb_exporter | 9216 | 每台 MongoDB 节点 |
+| Prometheus | 9090 | 监控服务器 |
+| Alertmanager | 9093 | 监控服务器 |
+| webhook-bridge | 8090 | 监控服务器 |
+
+## MongoDB 监控用户
+
+用户名：monitor_user  
+权限：clusterMonitor + read local  
+
+**创建位置（重要）：**
+- mongos 上创建一次（给 mongos exporter 用）
+- 每个 shard 副本集的 Primary 上各创建一次（给直连 shard 的 exporter 用）
+- config server 副本集的 Primary 上创建一次（给 config server exporter 用）
+
+通过 mongos 创建的用户无法用于直连 shard 节点认证。
+
+```javascript
+use admin
+db.createUser({
+  user: "monitor",
+  pwd: "密码",
+  roles: [
+    { role: "clusterMonitor", db: "admin" },
+    { role: "read", db: "local" }
+  ]
+})
+```
+
+## mongodb_exporter 启动命令
+
+```bash
+./mongodb_exporter \
+  --mongodb.uri="mongodb://monitor_user:密码@127.0.0.1:27017/admin" \
+  --web.listen-address=":9216"
+```
+
+注意：URI 必须指定 `/admin` 或 `?authSource=admin`，否则认证失败。
+
+## 连接影响
+
+- 每个 exporter 对 MongoDB 实例维持 1 个长连接
+- 对连接数几乎无影响
+
+## 报警接口（欧洲区域）
+
+- 接口地址：`POST http://alert.monitor.ez.aws:8080/rest/v2/alert/7afb934cf90d4d0e`
+- Content-Type：application/json
+- content 字段必须包含 `V2_PAAS_mysql` 关键字，否则无法路由到 DBA
+
+### 请求体格式
+
+```json
+{
+  "app": "middleware_monitor_alert",
+  "title": "报警标题",
+  "content": "V2_PAAS_mysql MongoDB告警, 集群: xxx, 实例: xxx, 告警: xxx, 级别: xxx, 详情: xxx",
+  "level": "3",
+  "filter": "mongodb_集群名_endpoint",
+  "area": "5",
+  "recovery": "false",
+  "ruleId": "124",
+  "serviceName": "middleware_monitor_alert",
+  "endpoint": "节点IP",
+  "metaData": "{\"oncall\":0}"
+}
+```
+
+- 告警时：level=3, recovery=false
+- 恢复时：level=2, recovery=true
+
+## Prometheus 配置模板
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['localhost:9093']
+
+rule_files:
+  - "rules/*.yml"
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: 'mongodb-集群名-mongos'
+    static_configs:
+      - targets: ['IP:9216']
+        labels:
+          cluster: '集群名'
+          role: 'mongos'
+
+  - job_name: 'mongodb-集群名-shard1'
+    static_configs:
+      - targets: ['IP:9216', 'IP:9216', 'IP:9216']
+        labels:
+          cluster: '集群名'
+          role: 'shard'
+          shard: 'shard1'
+```
+
+## Alertmanager 配置
+
+```yaml
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: 'hiklink-webhook'
+  group_by: ['cluster', 'alertname']
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+
+receivers:
+  - name: 'hiklink-webhook'
+    webhook_configs:
+      - url: 'http://localhost:8090/webhook/alertmanager'
+        send_resolved: true
+```
+
+## 关键报警规则
+
+- MongoDBDown：实例宕机（critical）
+- MongoDBNoPrimary：副本集无 Primary（critical）
+- MongoDBReplicationLag：复制延迟 >10s（warning）
+- MongoDBConnectionsHigh：连接使用率 >80%（warning）
+- MongoDBExporterScrapeError：exporter 采集失败（critical）
+- MongoDBChunkImbalance：分片 chunk 不均衡（warning）
+- MongoDBDiskSpaceLow：数据盘空间 <15%（critical，需 node_exporter）
+
+## 操作备忘
+
+- Prometheus 热加载配置：`kill -HUP $(pidof prometheus)`
+- 测试 webhook-bridge 链路：
+```bash
+curl -X POST http://localhost:8090/webhook/alertmanager \
+  -H "Content-Type: application/json" \
+  -d '{"status":"firing","alerts":[{"status":"firing","labels":{"alertname":"MongoDBTestAlert","severity":"warning","cluster":"clusterA","instance":"10.201.1.74:9216"},"annotations":{"summary":"测试报警","description":"测试报警链路"},"startsAt":"2026-05-22T06:00:00Z","endsAt":"0001-01-01T00:00:00Z"}]}'
+```
+- repeat_interval 控制同一告警重复发送间隔，不是 bug
+- 重启 Alertmanager 并删除 data 目录可触发重新发送
+
+## 待完成事项
+
+- [ ] 其他 29 台节点部署 mongodb_exporter
+- [ ] Prometheus 添加所有节点
+- [ ] 正式报警规则替换测试规则
+- [ ] 所有服务改为 systemd 管理
+- [ ] 部署 Grafana + 导入 Dashboard
+- [ ] 部署 node_exporter（磁盘监控）
